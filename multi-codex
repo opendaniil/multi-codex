@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.2.0"
+STORAGE_ROOT="${HOME}/.multi-codex"
+
+abort() {
+  echo "Error: $1" >&2
+  exit 1
+}
+
+is_valid_profile_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] || return 1
+  [[ "$name" != "bin" && "$name" != ".templates" ]] || return 1
+}
+
+validate_name() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    abort "profile name required"
+  fi
+  if [[ "$name" == "bin" || "$name" == ".templates" ]]; then
+    abort "profile name '$name' is reserved"
+  fi
+  if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
+    abort "profile name must start with alphanumeric and contain only letters, numbers, or hyphens"
+  fi
+}
+
+profile_dir() {
+  local name="$1"
+  printf '%s/%s\n' "$STORAGE_ROOT" "$name"
+}
+
+assert_profile_delete_path() {
+  local dir="$1"
+  [ -n "$STORAGE_ROOT" ] || abort "refusing to operate with an empty storage root"
+  [ "$STORAGE_ROOT" != "/" ] || abort "refusing to operate on filesystem root"
+  case "$dir" in
+    "$STORAGE_ROOT"/*) ;;
+    *) abort "refusing to operate outside storage root: $dir" ;;
+  esac
+}
+
+new_profile() {
+  local name="$1"
+  validate_name "$name"
+
+  local dir
+  dir="$(profile_dir "$name")"
+  if [ -e "$dir" ]; then
+    abort "profile '$name' already exists"
+  fi
+
+  mkdir -p "$dir"
+  echo "Created profile '$name' at $dir"
+}
+
+list_profiles() {
+  if [ ! -d "$STORAGE_ROOT" ]; then
+    echo "(none)"
+    return
+  fi
+
+  local profiles
+  profiles="$(
+    find "$STORAGE_ROOT" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; |
+      while IFS= read -r name; do
+        if is_valid_profile_name "$name"; then
+          printf '%s\n' "$name"
+        fi
+      done |
+      sort
+  )"
+
+  if [ -z "$profiles" ]; then
+    echo "(none)"
+  else
+    printf '%s\n' "$profiles"
+  fi
+}
+
+delete_profile() {
+  local name="$1"
+  validate_name "$name"
+
+  local dir
+  dir="$(profile_dir "$name")"
+  if [ ! -d "$dir" ]; then
+    abort "profile '$name' does not exist"
+  fi
+  assert_profile_delete_path "$dir"
+
+  if [ ! -t 0 ]; then
+    abort "delete requires an interactive terminal"
+  fi
+
+  local answer
+  read -r -p "Delete profile '$name' and all its data? [y/N] " answer
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    rm -rf "$dir"
+    echo "Deleted profile '$name'"
+  else
+    echo "Aborted."
+  fi
+}
+
+launch_profile() {
+  local name="$1"
+  shift
+  validate_name "$name"
+
+  local dir
+  dir="$(profile_dir "$name")"
+  if [ ! -d "$dir" ]; then
+    abort "profile '$name' does not exist. Run: multi-codex new $name"
+  fi
+
+  CODEX_HOME="$dir" exec codex "$@"
+}
+
+doctor() {
+  local errors=0
+  local warnings=0
+
+  echo "Checking multi-codex environment..."
+  echo "  [OK] Bash: ${BASH_VERSION}"
+  echo "  [INFO] Profile storage: $STORAGE_ROOT"
+
+  if [ -d "$STORAGE_ROOT" ]; then
+    if [ -w "$STORAGE_ROOT" ]; then
+      echo "  [OK] Storage root is writable"
+    else
+      echo "  [FAIL] Storage root exists but is not writable"
+      errors=$((errors + 1))
+    fi
+  else
+    echo "  [WARN] Storage root does not exist yet"
+    warnings=$((warnings + 1))
+  fi
+
+  local codex_version
+  if codex_version="$(codex --version 2>&1)"; then
+    if [ -n "$codex_version" ]; then
+      echo "  [OK] Codex CLI: $codex_version"
+    else
+      echo "  [OK] Codex CLI: found"
+    fi
+  else
+    echo "  [FAIL] Codex CLI: not found on PATH or failed to run"
+    errors=$((errors + 1))
+  fi
+
+  if [ "$errors" -gt 0 ]; then
+    echo "Found $errors error(s) and $warnings warning(s)."
+    exit 1
+  fi
+
+  echo "Found $warnings warning(s)."
+}
+
+usage() {
+  cat <<'EOF'
+Usage: multi-codex <command> [args]
+
+Commands:
+  new <profile>              Create an isolated Codex profile
+  list                       List profiles
+  delete <profile>           Delete a profile after confirmation
+  doctor                     Check Bash, Codex, and profile storage
+  help                       Show this help
+  version                    Show version number
+  <profile> [codex args...]  Launch Codex with the selected profile
+
+Profile names: alphanumeric and hyphens only (e.g. work, personal, test-1)
+EOF
+}
+
+command="${1:-}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$command" in
+  new)
+    [ "$#" -eq 1 ] || abort "usage: multi-codex new <profile>"
+    new_profile "$1"
+    ;;
+  list)
+    [ "$#" -eq 0 ] || abort "usage: multi-codex list"
+    list_profiles
+    ;;
+  delete)
+    [ "$#" -eq 1 ] || abort "usage: multi-codex delete <profile>"
+    delete_profile "$1"
+    ;;
+  doctor)
+    [ "$#" -eq 0 ] || abort "usage: multi-codex doctor"
+    doctor
+    ;;
+  help|--help|-h)
+    [ "$#" -eq 0 ] || abort "usage: multi-codex help"
+    usage
+    ;;
+  version|--version|-v)
+    [ "$#" -eq 0 ] || abort "usage: multi-codex version"
+    echo "multi-codex $VERSION"
+    ;;
+  "")
+    usage
+    exit 1
+    ;;
+  *)
+    launch_profile "$command" "$@"
+    ;;
+esac
